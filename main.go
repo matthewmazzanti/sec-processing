@@ -114,16 +114,16 @@ type Runner struct {
 
 // Create a new runner. This returns the runner to interact with, and the input
 // and output channels to send data to
-func NewRunner() (Runner, chan<- string, <-chan FilingResult) {
-	filenames := make(chan string)
+func NewRunner(filenames <-chan string, count int) (Runner, <-chan FilingResult) {
 	results := make(chan FilingResult)
 	runner := Runner{
 		filenames: filenames,
 		results: results,
 		wg: &sync.WaitGroup{},
 	}
+	runner.runCount(count)
 
-	return runner, filenames, results
+	return runner, results
 }
 
 // Start up n jobs to run the work
@@ -173,8 +173,8 @@ func (r *Runner) run() {
 }
 
 func main() {
-	runner, filenames, results := NewRunner()
-	runner.runCount(5)
+	filenames := make(chan string)
+	_, results := NewRunner(filenames, 5)
 
 	go func() {
 		// Ignore error, only errors on malformed glob
