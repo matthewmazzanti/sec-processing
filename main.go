@@ -1,87 +1,82 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"log"
+	"regexp"
 	"sync"
 	"time"
 )
 
 type SecData struct {
 	Filings struct {
-		Recent Filing `json:"recent"`
+		Recent SecFilings `json:"recent"`
+		Files []SecFile `json:"files"`
 	} `json:"filings"`
 }
 
-type Filing struct {
-	FilingDates []string `json:"filingDate"`
+type SecFile struct {
+	Name string `json:"name"`
+	FilingCount int `json:"filingCount"`
+	FilingFrom string `json:"filingFrom"`
+	FilingTo string `json:"filingTo"`
 }
 
-func mostRecentFiling(filename string) (*time.Time, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+type SecFilings struct {
+	AccessionNumber []string `json:"accessionNumber"`
+	FilingDate []string `json:"filingDate"`
+	ReportDate []string `json:"reportDate"`
+	AcceptanceDateTime []string `json:"acceptanceDateTime"`
+	Act []string `json:"act"`
+	Form []string `json:"form"`
+	FileNumber []string `json:"fileNumber"`
+	Items []string `json:"items"`
+	Size []int `json:"size"`
+	IsXBRL []int `json:"isXBRL"`
+	IsInlineXBRL []int `json:"isInlineXBRL"`
+	PrimaryDocument []string `json:"primaryDocument"`
+	PrimaryDocDescription []string `json:"primaryDocDescription"`
+}
 
-	// Go's JSON decoder. Can read from file objects with the NewDecoder and
-	// strings with Unmarshal.
-	//
-	// While reading, go reflects the struct to read the tags - the items
-	// marked `json:"pathName"` above - to read data into the struct. This
-	// gives you a nice way to build types for the data you are accessing.
-	//
-	// Note the use of the & to pass a pointer. This function doesn't return
-	// data, just fills the passed pointer.
-	//
-	// TODO: Reading all the data into memory may be less-than-ideal.
-	// Streaming json via the Token() call in the decoder may use less
-	// memory and improve cache locality - at the cost of complexity
-	var data SecData
-	err = json.NewDecoder(file).Decode(&data)
-	if err != nil {
-		return nil, err
-	}
+type SecFiling struct {
+	AccessionNumber string `json:"accessionNumber"`
+	FilingDate string `json:"filingDate"`
+	ReportDate string `json:"reportDate"`
+	AcceptanceDateTime string `json:"acceptanceDateTime"`
+	Act string `json:"act"`
+	Form string `json:"form"`
+	FileNumber string `json:"fileNumber"`
+	Items string `json:"items"`
+	Size int `json:"size"`
+	IsXBRL int `json:"isXBRL"`
+	IsInlineXBRL int `json:"isInlineXBRL"`
+	PrimaryDocument string `json:"primaryDocument"`
+	PrimaryDocDescription string `json:"primaryDocDescription"`
+}
 
-	// Read into new variable for convinence
-	filingDates := data.Filings.Recent.FilingDates
+func (f *SecFilings) Transpose() []SecFiling {
+	size := len(f.AccessionNumber)
+	res := make([]SecFiling, size)
 
-	// Early exit in case there are no filing dates
-	if len(filingDates) == 0 {
-		return nil, nil
-	}
-
-	
-	// The date here is go's format string. Yes this is terrible.
-	date, err := time.Parse("2006-01-02", filingDates[0])
-	if err != nil {
-		return nil, err
-	}
-
-	// Range over the rest of the filing dates to see if any are newer than
-	// the first
-	//
-	// Couple things here:
-	// - Range always returns a pair of the index and value from the slice.
-	// - Slice notation creates a new "view" of the underlying array, so
-	// unlike python this requires no new allocations
-	//
-	// This loop may not be needed, the dates seem to be in order. Makes for
-	// a good example, and a trivial fix either way
-	for _, filingDate := range filingDates[1:] {
-		nextDate, err := time.Parse("2006-05-04", filingDate)
-		if err != nil {
-			return nil, err
-		}
-
-		if nextDate.After(date) {
-			date = nextDate
-		}
+	for i := 0; i < size; i++ {
+		filing := res[i]
+		filing.AccessionNumber = f.AccessionNumber[i]
+		filing.FilingDate = f.FilingDate[i]
+		filing.ReportDate = f.ReportDate[i]
+		filing.AcceptanceDateTime = f.AcceptanceDateTime[i]
+		filing.Act = f.Act[i]
+		filing.Form = f.Form[i]
+		filing.Items = f.Items[i]
+		filing.Size = f.Size[i]
+		filing.IsXBRL = f.IsXBRL[i]
+		filing.IsInlineXBRL = f.IsInlineXBRL[i]
+		filing.PrimaryDocument = f.PrimaryDocument[i]
+		filing.PrimaryDocDescription = f.PrimaryDocDescription[i]
 	}
 
-	return &date, nil
+	return res
 }
 
 // Result of the calculation. Since this is going to be returned from a thread,
@@ -92,102 +87,95 @@ type FilingResult struct {
 	date time.Time
 }
 
-// A manager struct for the channels and waitgroup. A channel is a FIFO queue
-// for typed values in go. It allows data producers to send data to it, and will
-// block block until that data is recieved. The wait group is a bounded
-// semaphore, used to track the number of jobs running
-//
-// Create a struct to manage the threading state. We have three values we care
-// about from the context of the runner:
-// - The input channel - filenames. This is where the rest of the program will
-// send values to the runner to be processed.
-// - The output channel - results. This is where the runner will send output
-// results.
-// - A "Wait group" - a bounded semaphore. Channels need to be closed from
-// alternative threads, so this provides a way for us to know that all
-// processing has completed
-type Runner struct {
-	filenames <-chan string
-	results chan<- FilingResult
-	wg *sync.WaitGroup
+var recentRe = regexp.MustCompile(`^CIK\d{10}.json$`)
+var submissionRe = regexp.MustCompile(`^CIK\d{10}-submissions-\d{3}.json$`)
+
+type ZipWorker struct {
+	submissions map[string]*zip.File
 }
 
-// Create a new runner. This returns the runner to interact with, and the input
-// and output channels to send data to
-func NewRunner(filenames <-chan string, count int) (Runner, <-chan FilingResult) {
-	results := make(chan FilingResult)
-	runner := Runner{
-		filenames: filenames,
-		results: results,
-		wg: &sync.WaitGroup{},
-	}
-	runner.runCount(count)
+func (zw *ZipWorker) Work(zipFile *zip.File) (string, error) {
+	name := zipFile.FileHeader.Name
 
-	return runner, results
-}
-
-// Start up n jobs to run the work
-func (r *Runner) runCount(n int) {
-	r.wg.Add(n)
-	for i := 0; i < n; i++ {
-		go r.run()
+	file, err := zipFile.Open()
+	if err != nil {
+		return "", err
 	}
 
-	// Once all of the jobs have finished processing, close the result
-	// channel. For this example, this is not needed, but for longer
-	// runnning processes this is proper behavior
-	go func() {
-		r.wg.Wait()
-		close(r.results)
-	}()
-}
+	var data SecData
+	err = json.NewDecoder(file).Decode(&data)
+	if err != nil {
+		return "", err
+	}
 
-func (r *Runner) run() {
-	// Recieve filename from input channel
-	for filename := range r.filenames {
-		// Run the check
-		date, err := mostRecentFiling(filename)
+	err = file.Close()
+	if err != nil {
+		return "", err
+	}
 
-		// Want to continue processing if there are errors. Log a
-		// message and continue
-		if err != nil {
-			fmt.Printf("Error for file %s, %v\n", filename, err)
-			continue
-		}
-
-		if date == nil {
-			fmt.Printf("No dates in file %s\n", filename)
-			continue
-		}
-
-		// Send result over output channel
-		r.results <- FilingResult{
-			filename: filename,
-			date: *date,
+	for _, refSecFile := range data.Filings.Files {
+		name := refSecFile.Name
+		_, ok := zw.submissions[name]
+		if !ok {
+			return "", fmt.Errorf("filename not found %s", name)
 		}
 	}
 
-	// Notify that the work has completed. This executes once the filenames
-	// channel is closed and the loop exits
-	r.wg.Done()
+	l := len(data.Filings.Recent.Transpose())
+	
+	return fmt.Sprintf("%s, %d", name, l), nil
 }
 
 func main() {
-	filenames := make(chan string)
-	_, results := NewRunner(filenames, 5)
+	f, err := zip.OpenReader("submissions.zip")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	recents := make([]*zip.File, 0)
+	submissions := make(map[string]*zip.File, 0)
+	for i := 0; i < len(f.File); i++ {
+		file := f.File[i]
+		name := file.FileHeader.Name
+
+		if recentRe.MatchString(name) {
+			recents = append(recents, file)
+		}
+
+		if submissionRe.MatchString(name) {
+			submissions[name] = file
+		}
+
+		// There's also a placeholder.txt file, not useful
+	}
+
+	worker := ZipWorker{ submissions: submissions }
+
+
+	buffer := 10
+	files := make(chan Tagged[string, *zip.File], buffer)
+	outChan, errChan := NewWorkerPool(files, worker.Work, 10, buffer)
 
 	go func() {
-		// Ignore error, only errors on malformed glob
-		// TODO: This may not be the correct approach for almost a
-		// million files. filepath.Walk may prove a better abstraction
-		globFiles, _ := filepath.Glob("data/*.json")
-		for _, filename := range globFiles {
-			filenames <- filename
+		for _, recent := range recents {
+			files <- tag(recent.FileHeader.Name, recent)
 		}
-		close(filenames)
+		close(files)
 	}()
 
-	for res := range results {
-		fmt.Printf("file: %s, date: %v\n", res.filename, res.date)
-	}
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		for tag := range outChan {
+			fmt.Printf("%s\n", tag.Value)
+		}
+		wg.Done()
+	}()
+	go func() {
+		for tag := range errChan {
+			fmt.Printf("Error: %s, %s\n", tag.Tag, tag.Value)
+		}
+		wg.Done()
+	}()
+	wg.Wait()
 }
